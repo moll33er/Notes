@@ -65,10 +65,9 @@ echo "软件源类型：$SOURCE_TYPE"
 
 # 安装基础依赖
 echo
-echo "正在更新系统并安装基础依赖..."
+echo "正在更新 apt 缓存并安装基础依赖..."
 
 apt update
-apt upgrade -y
 
 apt install -y \
     curl \
