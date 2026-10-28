@@ -1,211 +1,249 @@
 #!/usr/bin/env bash
+set -eo pipefail
 
-set -e
-
-# ============================================================
-# Docker 一键安装脚本
-# 支持系统：Debian / Ubuntu
-# 支持源：
-#   官方源：bash install-docker.sh
-#   清华源：bash install-docker.sh tuna
-#
-# 可选：添加用户到 docker 组
-#   bash install-docker.sh tuna www-data
-# ============================================================
-
-SOURCE_TYPE="${1:-official}"
+# Debian / Ubuntu。无参数自动选源；仍支持 official/tuna/ustc [用户名]。
+SOURCE_TYPE="${1:-auto}"
 DOCKER_USER="${2:-}"
-
 DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
 DOCKER_GPG_KEY="/usr/share/keyrings/docker-ce.gpg"
 DOCKER_APT_LIST="/etc/apt/sources.list.d/docker.list"
 
-echo "============================================================"
-echo " Docker 安装脚本"
-echo "============================================================"
+# 各脚本保持可独立下载；此小段有意不依赖仓库中的公共文件。
+region_get() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 3 --max-time 6 "$1"
+    else
+        wget -qO- --timeout=3 --tries=1 "$1"
+    fi
+}
 
-# 检查 root 权限
+detect_region() {
+    case "${INSTALL_REGION:-auto}" in
+        cn|global)
+            echo "==> 手动指定网络区域：$INSTALL_REGION" >&2
+            return
+            ;;
+        auto) ;;
+        *)
+            echo "错误：INSTALL_REGION 只支持 auto、cn、global。" >&2
+            return 1
+            ;;
+    esac
+
+    local country
+    country="$(region_get https://ipapi.co/country/ 2>/dev/null | tr -d '\r\n')" || country=""
+    if ! [[ "$country" =~ ^[A-Z]{2}$ ]]; then
+        country="$(region_get https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^loc=//p' | tr -d '\r\n')" || country=""
+    fi
+    if [ "$country" = CN ]; then
+        INSTALL_REGION=cn
+        echo "==> 出口 IP 地区：CN，优先使用国内加速。" >&2
+    else
+        INSTALL_REGION=global
+        if [[ "$country" =~ ^[A-Z]{2}$ ]]; then
+            echo "==> 出口 IP 地区：$country，优先直连。" >&2
+        else
+            echo "警告：无法识别出口 IP 地区，使用直连；国内机器可设置 INSTALL_REGION=cn。" >&2
+        fi
+    fi
+}
+
+fetch() {
+    curl -fsSL --proto '=https' --proto-redir '=https' \
+        --connect-timeout 8 --max-time 60 --retry 2 --retry-max-time 120 \
+        --speed-limit 1024 --speed-time 15 "$1" -o "$2"
+}
+
+prepare_repository() {
+    local base key_url expected fingerprints
+    local -a candidates
+    if [ -n "${DOCKER_REPO_URL:-}" ]; then
+        candidates=("${DOCKER_REPO_URL%/}")
+    else
+        case "$SOURCE_TYPE" in
+            auto)
+                if [ "$INSTALL_REGION" = cn ]; then
+                    candidates=("https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/$OS_ID"
+                                "https://mirrors.ustc.edu.cn/docker-ce/linux/$OS_ID"
+                                "https://download.docker.com/linux/$OS_ID")
+                else
+                    candidates=("https://download.docker.com/linux/$OS_ID")
+                fi
+                ;;
+            official) candidates=("https://download.docker.com/linux/$OS_ID") ;;
+            tuna) candidates=("https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/$OS_ID") ;;
+            ustc) candidates=("https://mirrors.ustc.edu.cn/docker-ce/linux/$OS_ID") ;;
+        esac
+    fi
+    expected="${DOCKER_EXPECTED_FINGERPRINT:-9DC858229FC7DD38854AE2D88D81803C0EBFCD88}"
+    expected="$(printf '%s' "$expected" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+    for base in "${candidates[@]}"; do
+        if [[ "$base" != https://* || "$base" =~ [[:space:]] ]]; then
+            echo "错误：Docker 仓库必须是无空白字符的 HTTPS URL。" >&2
+            return 1
+        fi
+        key_url="${DOCKER_GPG_URL:-$base/gpg}"
+        echo "==> 尝试 Docker 仓库：$base" >&2
+        if fetch "$base/dists/$OS_CODENAME/Release" "$TMP_DIR/Release" &&
+           fetch "$key_url" "$TMP_DIR/docker.asc"; then
+            fingerprints="$(gpg --batch --show-keys --with-colons --fingerprint "$TMP_DIR/docker.asc" | awk -F: '/^pub:/ {primary=1; next} /^sub:/ {primary=0} /^fpr:/ && primary {print toupper($10); primary=0}')" || fingerprints=""
+            if [ "$fingerprints" != "$expected" ]; then
+                echo "错误：Docker 签名密钥指纹不匹配，停止，不替换现有配置。" >&2
+                return 1
+            fi
+            gpg --batch --yes --dearmor -o "$TMP_DIR/docker.gpg" "$TMP_DIR/docker.asc" || return 1
+            printf 'deb [arch=%s signed-by=%s] %s %s stable\n' \
+                "$(dpkg --print-architecture)" "$DOCKER_GPG_KEY" "$base" "$OS_CODENAME" > "$TMP_DIR/docker.list"
+            echo "==> 已选 Docker 仓库：$base" >&2
+            return 0
+        fi
+        echo "警告：仓库或密钥下载失败：$base" >&2
+    done
+    echo "错误：Docker 仓库均不可用；原 key 和源文件未替换。" >&2
+    return 1
+}
+
+install_docker_packages() {
+    local i file backup stamp
+    local -a targets=("$DOCKER_GPG_KEY" "$DOCKER_APT_LIST")
+    local -a staged=("$TMP_DIR/docker.gpg" "$TMP_DIR/docker.list")
+    local -a backups=()
+    stamp="$(date +%Y%m%d%H%M%S).$$"
+    for i in "${!targets[@]}"; do
+        file="${targets[$i]}"
+        backup=""
+        if [ -f "$file" ]; then
+            backup="$file.bak.$stamp"
+            cp -p "$file" "$backup" || return 1
+        fi
+        backups+=("$backup")
+    done
+    # 命令链中任一步失败，都恢复本次操作前的源配置；不回退已安装的软件包。
+    if install -m 644 "${staged[0]}" "${targets[0]}" &&
+       install -m 644 "${staged[1]}" "${targets[1]}" &&
+       apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update &&
+       apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin docker-ce-rootless-extras; then
+        return 0
+    fi
+    echo "错误：软件源更新或安装失败，恢复原有源配置；软件包可能已部分安装，请检查上方 apt 输出。" >&2
+    for i in "${!targets[@]}"; do
+        if [ -n "${backups[$i]}" ]; then
+            cp -p "${backups[$i]}" "${targets[$i]}" || return 1
+        else
+            rm -f "${targets[$i]}" || return 1
+        fi
+    done
+    return 1
+}
+
+merge_daemon_config() {
+    python3 - "$DOCKER_DAEMON_JSON" "$TMP_DIR/daemon.json" "${DOCKER_REGISTRY_MIRRORS:-}" <<'PY'
+import json
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+
+source, target, mirrors = sys.argv[1:]
+path = Path(source)
+config = json.loads(path.read_text()) if path.exists() else {}
+if not isinstance(config, dict):
+    raise SystemExit("错误：daemon.json 必须是 JSON 对象。")
+config.setdefault("log-driver", "json-file")
+if config["log-driver"] == "json-file":
+    opts = config.setdefault("log-opts", {})
+    opts.setdefault("max-size", "20m")
+    opts.setdefault("max-file", "3")
+for key, value in {"ipv6": True, "experimental": True, "ip6tables": True}.items():
+    config.setdefault(key, value)
+if config["ipv6"]:
+    config.setdefault("fixed-cidr-v6", "fd00:dead:beef:c0::/80")
+if mirrors:
+    urls = mirrors.replace(",", " ").split()
+    if not urls:
+        raise SystemExit("错误：DOCKER_REGISTRY_MIRRORS 不能为空白。")
+    for url in urls:
+        parsed = urlsplit(url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise SystemExit("错误：镜像加速地址必须是无凭据、查询参数和片段的 HTTPS URL。")
+    config["registry-mirrors"] = list(dict.fromkeys(url.rstrip("/") for url in urls))
+Path(target).write_text(json.dumps(config, indent=4) + "\n")
+PY
+}
+
+configure_daemon() {
+    local backup=""
+    mkdir -p /etc/docker
+    merge_daemon_config || return 1
+    dockerd --validate --config-file "$TMP_DIR/daemon.json" || return 1
+    if [ -f "$DOCKER_DAEMON_JSON" ]; then
+        backup="${DOCKER_DAEMON_JSON}.bak.$(date +%Y%m%d%H%M%S).$$"
+        cp -p "$DOCKER_DAEMON_JSON" "$backup" || return 1
+        echo "==> 已备份 Docker 配置：$backup"
+    fi
+    install -m 644 "$TMP_DIR/daemon.json" "${DOCKER_DAEMON_JSON}.new" || return 1
+    mv -f "${DOCKER_DAEMON_JSON}.new" "$DOCKER_DAEMON_JSON" || return 1
+    if ! systemctl restart docker; then
+        echo "错误：Docker 重启失败，恢复本次修改前的配置。" >&2
+        if [ -n "$backup" ]; then
+            cp -p "$backup" "$DOCKER_DAEMON_JSON"
+        else
+            rm -f "$DOCKER_DAEMON_JSON"
+        fi
+        systemctl restart docker || echo "错误：恢复配置后仍无法启动，请检查 journalctl -u docker。" >&2
+        return 1
+    fi
+}
+
 if [ "$(id -u)" -ne 0 ]; then
-    echo "错误：请使用 root 用户运行此脚本"
-    echo "例如：sudo -i 后再执行"
+    echo "错误：请使用 root 或 sudo 运行。" >&2
     exit 1
 fi
-
-# 检查系统
+case "$SOURCE_TYPE" in
+    auto|official|tuna|ustc) ;;
+    *) echo "警告：未知软件源 $SOURCE_TYPE，按旧版行为使用 official。" >&2; SOURCE_TYPE=official ;;
+esac
 if [ ! -f /etc/os-release ]; then
-    echo "错误：无法识别当前系统"
+    echo "错误：无法识别当前系统。" >&2
     exit 1
 fi
-
 . /etc/os-release
-
-OS_ID="${ID}"
-OS_CODENAME=""
-
-if command -v lsb_release >/dev/null 2>&1; then
+OS_ID="$ID"
+OS_CODENAME="${VERSION_CODENAME:-}"
+if [ -z "$OS_CODENAME" ] && command -v lsb_release >/dev/null 2>&1; then
     OS_CODENAME="$(lsb_release -sc)"
-else
-    OS_CODENAME="${VERSION_CODENAME:-}"
 fi
-
-if [ -z "$OS_CODENAME" ]; then
-    echo "错误：无法获取系统代号"
+if [[ "$OS_ID" != debian && "$OS_ID" != ubuntu ]] || [ -z "$OS_CODENAME" ]; then
+    echo "错误：仅支持能识别发行版代号的 Debian / Ubuntu。" >&2
     exit 1
 fi
+case "${INSTALL_REGION:-auto}" in auto|cn|global) ;; *) echo "错误：INSTALL_REGION 只支持 auto、cn、global。" >&2; exit 1 ;; esac
 
-if [ "$OS_ID" != "debian" ] && [ "$OS_ID" != "ubuntu" ]; then
-    echo "错误：当前系统不是 Debian 或 Ubuntu"
-    echo "当前系统：$OS_ID"
-    exit 1
-fi
-
-echo "系统类型：$OS_ID"
-echo "系统代号：$OS_CODENAME"
-echo "软件源类型：$SOURCE_TYPE"
-
-# 安装基础依赖
-echo
-echo "正在更新 apt 缓存并安装基础依赖..."
-
-apt update
-
-apt install -y \
-    curl \
-    vim \
-    wget \
-    gnupg \
-    dpkg \
-    apt-transport-https \
-    lsb-release \
-    ca-certificates
-
-# 创建 keyrings 目录
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+export GNUPGHOME="$TMP_DIR/gnupg"
+install -d -m 700 "$GNUPGHOME"
+echo "==> 安装基础依赖（沿用当前系统软件源）"
+apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y curl gnupg ca-certificates python3
+detect_region
+prepare_repository
 mkdir -p /usr/share/keyrings
-
-# 添加 Docker GPG 公钥和软件源
-echo
-echo "正在添加 Docker GPG 公钥和 apt 源..."
-
-rm -f "$DOCKER_GPG_KEY"
-rm -f "$DOCKER_APT_LIST"
-
-if [ "$SOURCE_TYPE" = "tuna" ]; then
-    # 清华 TUNA 源
-    if [ "$OS_ID" = "debian" ]; then
-        curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor > "$DOCKER_GPG_KEY"
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=$DOCKER_GPG_KEY] https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/debian $OS_CODENAME stable" > "$DOCKER_APT_LIST"
-    elif [ "$OS_ID" = "ubuntu" ]; then
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor > "$DOCKER_GPG_KEY"
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=$DOCKER_GPG_KEY] https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/ubuntu $OS_CODENAME stable" > "$DOCKER_APT_LIST"
-    fi
-else
-    # Docker 官方源
-    if [ "$OS_ID" = "debian" ]; then
-        curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor > "$DOCKER_GPG_KEY"
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=$DOCKER_GPG_KEY] https://download.docker.com/linux/debian $OS_CODENAME stable" > "$DOCKER_APT_LIST"
-    elif [ "$OS_ID" = "ubuntu" ]; then
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor > "$DOCKER_GPG_KEY"
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=$DOCKER_GPG_KEY] https://download.docker.com/linux/ubuntu $OS_CODENAME stable" > "$DOCKER_APT_LIST"
-    fi
-fi
-
-chmod 644 "$DOCKER_GPG_KEY"
-
-# 安装 Docker
-echo
-echo "正在安装 Docker CE..."
-
-apt update
-
-apt install -y \
-    docker-ce \
-    docker-ce-cli \
-    containerd.io \
-    docker-compose-plugin
-
-# 启动并设置开机自启
-echo
-echo "正在启动 Docker 服务..."
-
+install_docker_packages
 systemctl enable docker
-systemctl restart docker
+configure_daemon
 
-# 安装 rootless extras
-echo
-echo "正在安装 docker-ce-rootless-extras..."
-
-apt install -y docker-ce-rootless-extras
-
-# 可选：添加用户到 docker 组
 if [ -n "$DOCKER_USER" ]; then
-    echo
-    echo "正在将用户 $DOCKER_USER 添加到 docker 组..."
-
     if id "$DOCKER_USER" >/dev/null 2>&1; then
         usermod -aG docker "$DOCKER_USER"
-        echo "用户 $DOCKER_USER 已加入 docker 组"
-        echo "注意：该用户需要重新登录后权限才会生效"
+        echo "==> $DOCKER_USER 已加入 docker 组，请重新登录或执行 newgrp docker。"
     else
-        echo "警告：用户 $DOCKER_USER 不存在，跳过添加 docker 组"
+        echo "警告：用户 $DOCKER_USER 不存在，未加入 docker 组。" >&2
     fi
 fi
-
-# 配置 Docker daemon.json
-echo
-echo "正在配置 Docker daemon.json..."
-
-mkdir -p /etc/docker
-
-if [ -f "$DOCKER_DAEMON_JSON" ]; then
-    BACKUP_FILE="${DOCKER_DAEMON_JSON}.bak.$(date +%Y%m%d%H%M%S)"
-    cp "$DOCKER_DAEMON_JSON" "$BACKUP_FILE"
-    echo "已备份原配置到：$BACKUP_FILE"
+if [ "$INSTALL_REGION" = cn ] && [ -z "${DOCKER_REGISTRY_MIRRORS:-}" ]; then
+    echo "==> 国内软件包源不等于 Docker Hub 加速；已保留现有镜像配置。"
+    echo "==> 如需新增镜像加速，请设置 DOCKER_REGISTRY_MIRRORS 为你信任的 HTTPS 地址。"
 fi
-
-cat > "$DOCKER_DAEMON_JSON" << EOF
-{
-    "log-driver": "json-file",
-    "log-opts": {
-        "max-size": "20m",
-        "max-file": "3"
-    },
-    "ipv6": true,
-    "fixed-cidr-v6": "fd00:dead:beef:c0::/80",
-    "experimental": true,
-    "ip6tables": true
-}
-EOF
-
-# 重启 Docker
-echo
-echo "正在重启 Docker..."
-
-systemctl restart docker
-
-# 检查安装结果
-echo
-echo "============================================================"
-echo " Docker 安装完成"
-echo "============================================================"
-
-echo
-echo "Docker 版本信息："
 docker version
-
-echo
-echo "Docker Compose 插件版本信息："
 docker compose version
-
-echo
-echo "============================================================"
-echo " 安装完成"
-echo "============================================================"
-
-if [ -n "$DOCKER_USER" ]; then
-    echo
-    echo "提示：用户 $DOCKER_USER 已加入 docker 组"
-    echo "请退出当前登录会话并重新登录，或执行："
-    echo
-    echo "  newgrp docker"
-    echo
-fi
+echo "==> Docker 安装完成"

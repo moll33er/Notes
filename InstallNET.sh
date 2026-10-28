@@ -39,6 +39,46 @@ export VER=''
 export setCMD=''
 export setConsole=''
 
+# 各脚本保持可独立下载；此小段有意不依赖仓库中的公共文件。
+region_get() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 3 --max-time 6 "$1"
+    else
+        wget -qO- --timeout=3 --tries=1 "$1"
+    fi
+}
+
+detect_region() {
+    case "${INSTALL_REGION:-auto}" in
+        cn|global)
+            echo "==> 手动指定网络区域：$INSTALL_REGION" >&2
+            return
+            ;;
+        auto) ;;
+        *)
+            echo "错误：INSTALL_REGION 只支持 auto、cn、global。" >&2
+            return 1
+            ;;
+    esac
+
+    local country
+    country="$(region_get https://ipapi.co/country/ 2>/dev/null | tr -d '\r\n')" || country=""
+    if ! [[ "$country" =~ ^[A-Z]{2}$ ]]; then
+        country="$(region_get https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^loc=//p' | tr -d '\r\n')" || country=""
+    fi
+    if [ "$country" = CN ]; then
+        INSTALL_REGION=cn
+        echo "==> 出口 IP 地区：CN，优先使用国内加速。" >&2
+    else
+        INSTALL_REGION=global
+        if [[ "$country" =~ ^[A-Z]{2}$ ]]; then
+            echo "==> 出口 IP 地区：$country，优先直连。" >&2
+        else
+            echo "警告：无法识别出口 IP 地区，使用直连；国内机器可设置 INSTALL_REGION=cn。" >&2
+        fi
+    fi
+}
+
 while [[ $# -ge 1 ]]; do
   case $1 in
     -v|--ver)
@@ -186,97 +226,144 @@ function dependence(){
 }
 
 function wget_spider(){
-  wget --no-check-certificate --spider --timeout=4 --tries=1 -o /dev/null "$1"
+  wget --spider --timeout=4 --tries=1 -o /dev/null "$1"
 }
 
 function wget_download(){
-  wget --no-check-certificate --timeout=20 --tries=3 --retry-connrefused --waitretry=2 -qO "$1" "$2"
+  local target="$1" url="$2" partial="$1.part.$$"
+  if wget --timeout=20 --tries=3 --retry-connrefused --waitretry=2 -qO "$partial" "$url"; then
+    mv -f "$partial" "$target"
+    return $?
+  fi
+  rm -f "$partial"
+  return 1
 }
 
 function wget_output(){
-  wget --no-check-certificate --timeout=20 --tries=3 --retry-connrefused --waitretry=2 -qO- "$1"
+  wget --timeout=20 --tries=3 --retry-connrefused --waitretry=2 -qO- "$1"
 }
 
-function selectMirror(){
-  [ $# -ge 3 ] || exit 1
-  Relese=$(echo "$1" |sed -r 's/(.*)/\L\1/')
-  DIST=$(echo "$2" |sed 's/\ //g' |sed -r 's/(.*)/\L\1/')
-  VER=$(echo "$3" |sed 's/\ //g' |sed -r 's/(.*)/\L\1/')
-  New=$(echo "$4" |sed 's/\ //g')
-  [ -n "$Relese" ] && [ -n "$DIST" ] && [ -n "$VER" ] || exit 1
-  if [ "$Relese" == "debian" ] || [ "$Relese" == "ubuntu" ]; then
-    [ "$DIST" == "focal" ] && legacy="legacy-" || legacy=""
-    TEMP="SUB_MIRROR/dists/${DIST}/main/installer-${VER}/current/${legacy}images/netboot/${Relese}-installer/${VER}/initrd.gz"
-  elif [ "$Relese" == "centos" ]; then
-    TEMP="SUB_MIRROR/${DIST}/os/${VER}/isolinux/initrd.img"
-  fi
-  [ -n "$TEMP" ] || exit 1
-  mirrorStatus=0
-  MirrorList=""
-  echo "$New" |grep -q '^http://\|^https://\|^ftp://' && MirrorList="$New"
-  if [ "$Relese" == "debian" ]; then
-    MirrorList="$MirrorList
-https://mirrors.tuna.tsinghua.edu.cn/debian
+# 输出候选，不在 stdout 写日志；自定义镜像始终优先。
+function mirror_candidates(){
+  local release="${1,,}" arch="$2" custom="${3:-}" domestic official
+  case "$release" in
+    debian)
+      domestic="https://mirrors.tuna.tsinghua.edu.cn/debian
 https://mirrors.ustc.edu.cn/debian
 https://mirrors.aliyun.com/debian
 https://repo.huaweicloud.com/debian
-https://mirrors.cloud.tencent.com/debian
-http://deb.debian.org/debian
-http://archive.debian.org/debian"
-  elif [ "$Relese" == "ubuntu" ]; then
-    if [ "$VER" == "arm64" ]; then
-      MirrorList="$MirrorList
-https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports
+https://mirrors.cloud.tencent.com/debian"
+      official="https://deb.debian.org/debian
+https://archive.debian.org/debian"
+      ;;
+    ubuntu)
+      if [ "$arch" = arm64 ]; then
+        domestic="https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports
 https://mirrors.ustc.edu.cn/ubuntu-ports
 https://mirrors.aliyun.com/ubuntu-ports
-https://repo.huaweicloud.com/ubuntu-ports
-http://ports.ubuntu.com"
-    else
-      MirrorList="$MirrorList
-https://mirrors.tuna.tsinghua.edu.cn/ubuntu
+https://repo.huaweicloud.com/ubuntu-ports"
+        official="https://ports.ubuntu.com"
+      else
+        domestic="https://mirrors.tuna.tsinghua.edu.cn/ubuntu
 https://mirrors.ustc.edu.cn/ubuntu
 https://mirrors.aliyun.com/ubuntu
 https://repo.huaweicloud.com/ubuntu
-https://mirrors.cloud.tencent.com/ubuntu
-http://archive.ubuntu.com/ubuntu
-http://ports.ubuntu.com"
-    fi
-  elif [ "$Relese" == "centos" ]; then
-    MirrorList="$MirrorList
-https://mirrors.tuna.tsinghua.edu.cn/centos-vault
+https://mirrors.cloud.tencent.com/ubuntu"
+        official="https://archive.ubuntu.com/ubuntu
+https://ports.ubuntu.com"
+      fi
+      ;;
+    centos)
+      domestic="https://mirrors.tuna.tsinghua.edu.cn/centos-vault
 https://mirrors.ustc.edu.cn/centos-vault
 https://mirrors.aliyun.com/centos-vault
-https://repo.huaweicloud.com/centos-vault
-http://vault.centos.org
+https://repo.huaweicloud.com/centos-vault"
+      official="https://vault.centos.org
 http://mirror.centos.org/centos"
+      ;;
+    *) return 1 ;;
+  esac
+  if [[ "$custom" =~ ^(https?|ftp):// ]] && [[ ! "$custom" =~ [[:space:]] ]]; then
+    printf '%s\n' "${custom%/}"
+  elif [ -n "$custom" ]; then
+    echo "错误：无效的自定义镜像 URL。" >&2
+    return 1
   fi
-  for Current in $MirrorList
-    do
-      [ -n "$Current" ] || continue
-      MirrorURL=`echo "$TEMP" |sed "s#SUB_MIRROR#${Current}#g"`
-      wget_spider "$MirrorURL"
-      [ $? -eq 0 ] && mirrorStatus=1 && break
-    done
-  [ $mirrorStatus -eq 1 ] && echo "$Current" || exit 1
+  if [ "$INSTALL_REGION" = cn ]; then
+    printf '%s\n%s\n' "$domestic" "$official"
+  else
+    printf '%s\n%s\n' "$official" "$domestic"
+  fi
 }
 
-function selectDebianFirmwareMirror(){
-  [ -n "$1" ] || exit 1
-  DIST="$1"
-  FirmwareList="
-https://mirrors.tuna.tsinghua.edu.cn/debian-cdimage
+function installer_prefix(){
+  local release="${1,,}" dist="$2" arch="$3" legacy=""
+  if [ "$release" = centos ]; then
+    printf '%s/os/%s/isolinux' "$dist" "$arch"
+  else
+    [ "$dist" = focal ] && legacy="legacy-"
+    printf 'dists/%s/main/installer-%s/current/%simages/netboot/%s-installer/%s' "$dist" "$arch" "$legacy" "$release" "$arch"
+  fi
+}
+
+function selectMirror(){
+  local candidates current prefix image=initrd.gz
+  candidates="$(mirror_candidates "$1" "$3" "${4:-}")" || return 1
+  prefix="$(installer_prefix "$1" "$2" "$3")" || return 1
+  [ "${1,,}" = centos ] && image=initrd.img
+  for current in $candidates; do
+    echo "==> 探测安装源：$current" >&2
+    if wget_spider "$current/$prefix/$image"; then
+      printf '%s\n' "$current"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# 任一文件失败就换源，绝不混用两个镜像站的 kernel/initrd。
+function download_installer_pair(){
+  local candidates current prefix initrd=initrd.gz kernel=linux
+  local output="$1" selected="$2"
+  candidates="$(mirror_candidates "$linux_relese" "$VER" "$tmpMirror")" || return 1
+  candidates="$(printf '%s\n%s\n' "$selected" "$candidates" | awk 'NF && !seen[$0]++')"
+  prefix="$(installer_prefix "$linux_relese" "$DIST" "$VER")" || return 1
+  if [ "$linux_relese" = centos ]; then initrd=initrd.img; kernel=vmlinuz; fi
+  for current in $candidates; do
+    echo "==> 下载安装器：$current" >&2
+    if wget_download "$output/initrd.candidate" "$current/$prefix/$initrd" &&
+       wget_download "$output/kernel.candidate" "$current/$prefix/$kernel"; then
+      mv -f "$output/initrd.candidate" "$output/initrd.img" || return 1
+      mv -f "$output/kernel.candidate" "$output/vmlinuz" || return 1
+      LinuxMirror="$current"
+      echo "==> 最终安装源：$LinuxMirror" >&2
+      return 0
+    fi
+    rm -f "$output/initrd.candidate" "$output/kernel.candidate"
+    echo "警告：安装器下载失败，切换下一镜像：$current" >&2
+  done
+  echo "错误：所有安装源下载均失败。" >&2
+  return 1
+}
+
+function download_debian_firmware(){
+  local dist="$1" target="$2" current domestic official candidates
+  domestic="https://mirrors.tuna.tsinghua.edu.cn/debian-cdimage
 https://mirrors.ustc.edu.cn/debian-cdimage
 https://mirrors.aliyun.com/debian-cdimage
-https://repo.huaweicloud.com/debian-cdimage
-http://cdimage.debian.org/cdimage"
-  for Current in $FirmwareList
-    do
-      [ -n "$Current" ] || continue
-      FirmwareURL="${Current}/unofficial/non-free/firmware/${DIST}/current/firmware.cpio.gz"
-      wget_spider "$FirmwareURL"
-      [ $? -eq 0 ] && echo "$Current" && return
-    done
-  exit 1
+https://repo.huaweicloud.com/debian-cdimage"
+  official="https://cdimage.debian.org/cdimage"
+  if [ "$INSTALL_REGION" = cn ]; then candidates="$domestic
+$official"; else candidates="$official
+$domestic"; fi
+  for current in $candidates; do
+    echo "==> 下载 firmware：$current" >&2
+    if wget_download "$target" "$current/unofficial/non-free/firmware/$dist/current/firmware.cpio.gz"; then
+      return 0
+    fi
+    echo "警告：firmware 下载失败，尝试下一镜像。" >&2
+  done
+  return 1
 }
 
 function netmask() {
@@ -386,6 +473,8 @@ if [[ "$Relese" == 'Debian' ]] || [[ "$Relese" == 'Ubuntu' ]]; then
 elif [[ "$Relese" == 'CentOS' ]]; then
   dependence wget,awk,grep,sed,cut,cat,lsblk,cpio,gzip,find,dirname,basename,file,xz;
 fi
+detect_region || exit 1
+
 [ -n "$tmpWORD" ] && dependence openssl
 [[ -n "$tmpWORD" ]] && myPASSWORD=`openssl passwd -1 "$tmpWORD"`;
 [[ -z "$myPASSWORD" ]] && myPASSWORD='$1$4BJZaD0A$y1QykUnJ6mXprENfwpseH0';
@@ -426,7 +515,7 @@ if [[ -n "$tmpDIST" ]]; then
         [[ "$isDigital" == '12' ]] && DIST='bookworm';
       }
     }
-    LinuxMirror=$(selectMirror "$Relese" "$DIST" "$VER" "$tmpMirror")
+    LinuxMirror=$(selectMirror "$Relese" "$DIST" "$VER" "$tmpMirror") || { echo "错误：没有可用的安装源。" >&2; exit 1; }
   fi
   if [[ "$Relese" == 'Ubuntu' ]]; then
     SpikCheckDIST='0'
@@ -443,12 +532,12 @@ if [[ -n "$tmpDIST" ]]; then
         # [[ "$isDigital" == '22.04' ]] && DIST='jammy';
       }
     }
-    LinuxMirror=$(selectMirror "$Relese" "$DIST" "$VER" "$tmpMirror")
+    LinuxMirror=$(selectMirror "$Relese" "$DIST" "$VER" "$tmpMirror") || { echo "错误：没有可用的安装源。" >&2; exit 1; }
   fi
   if [[ "$Relese" == 'CentOS' ]]; then
     SpikCheckDIST='1'
     DISTCheck="$(echo "$tmpDIST" |grep -o '[\.0-9]\{1,\}' |head -n1)";
-    LinuxMirror=$(selectMirror "$Relese" "$DISTCheck" "$VER" "$tmpMirror")
+    LinuxMirror=$(selectMirror "$Relese" "$DISTCheck" "$VER" "$tmpMirror") || { echo "错误：没有可用的安装源。" >&2; exit 1; }
     ListDIST="$(wget_output "$LinuxMirror/dir_sizes" |cut -f2 |grep '^[0-9]')"
     DIST="$(echo "$ListDIST" |grep "^$DISTCheck" |head -n1)"
     [[ -z "$DIST" ]] && {
@@ -473,18 +562,7 @@ if [[ -z "$LinuxMirror" ]]; then
   exit 1;
 fi
 
-if [[ "$SpikCheckDIST" == '0' ]]; then
-  DistsList="$(wget_output "$LinuxMirror/dists/" |grep -o 'href=.*/"' |cut -d'"' -f2 |sed '/-\|old\|Debian\|experimental\|stable\|test\|sid\|devel/d' |grep '^[^/]' |sed -n '1h;1!H;$g;s/\n//g;s/\//\;/g;$p')";
-  for CheckDEB in `echo "$DistsList" |sed 's/;/\n/g'`
-    do
-      [[ "$CheckDEB" == "$DIST" ]] && FindDists='1' && break;
-    done
-  [[ "$FindDists" == '0' ]] && {
-    echo -ne '\nThe dists version not found, Please check it! \n\n'
-    bash $0 error;
-    exit 1;
-  }
-fi
+# 安装器文件的可用性由探测和成对下载验证，不依赖镜像站目录索引。
 
 if [[ "$ddMode" == '1' ]]; then
   if [[ -n "$tmpURL" ]]; then
@@ -526,28 +604,16 @@ fi
 
 echo -e "\n[\033[33m$Relese\033[0m] [\033[33m$DIST\033[0m] [\033[33m$VER\033[0m] Downloading..."
 
+download_installer_pair /tmp "$LinuxMirror" || exit 1
 if [[ "$linux_relese" == 'debian' ]] || [[ "$linux_relese" == 'ubuntu' ]]; then
-  [ "$DIST" == "focal" ] && legacy="legacy-" || legacy=""
-  wget_download '/tmp/initrd.img' "${LinuxMirror}/dists/${DIST}/main/installer-${VER}/current/${legacy}images/netboot/${linux_relese}-installer/${VER}/initrd.gz"
-  [[ $? -ne '0' ]] && echo -ne "\033[31mError! \033[0mDownload 'initrd.img' for \033[33m$linux_relese\033[0m failed! \n" && exit 1
-  wget_download '/tmp/vmlinuz' "${LinuxMirror}/dists/${DIST}${inUpdate}/main/installer-${VER}/current/${legacy}images/netboot/${linux_relese}-installer/${VER}/linux"
-  [[ $? -ne '0' ]] && echo -ne "\033[31mError! \033[0mDownload 'vmlinuz' for \033[33m$linux_relese\033[0m failed! \n" && exit 1
-  MirrorHost="$(echo "$LinuxMirror" |awk -F'://|/' '{print $2}')";
-  MirrorFolder="$(echo "$LinuxMirror" |awk -F''${MirrorHost}'' '{print $2}')";
+  MirrorHost="$(echo "$LinuxMirror" |awk -F'://|/' '{print $2}')"
+  MirrorFolder="${LinuxMirror#*://}"
+  MirrorFolder="${MirrorFolder#"$MirrorHost"}"
   [ -n "$MirrorFolder" ] || MirrorFolder="/"
-elif [[ "$linux_relese" == 'centos' ]]; then
-  wget_download '/tmp/initrd.img' "${LinuxMirror}/${DIST}/os/${VER}/isolinux/initrd.img"
-  [[ $? -ne '0' ]] && echo -ne "\033[31mError! \033[0mDownload 'initrd.img' for \033[33m$linux_relese\033[0m failed! \n" && exit 1
-  wget_download '/tmp/vmlinuz' "${LinuxMirror}/${DIST}/os/${VER}/isolinux/vmlinuz"
-  [[ $? -ne '0' ]] && echo -ne "\033[31mError! \033[0mDownload 'vmlinuz' for \033[33m$linux_relese\033[0m failed! \n" && exit 1
-else
-  bash $0 error;
-  exit 1;
 fi
 if [[ "$linux_relese" == 'debian' ]]; then
   if [[ "$IncFirmware" == '1' ]]; then
-    FirmwareMirror=$(selectDebianFirmwareMirror "$DIST")
-    wget_download '/tmp/firmware.cpio.gz' "${FirmwareMirror}/unofficial/non-free/firmware/${DIST}/current/firmware.cpio.gz"
+    download_debian_firmware "$DIST" /tmp/firmware.cpio.gz
     [[ $? -ne '0' ]] && echo -ne "\033[31mError! \033[0mDownload 'firmware' for \033[33m$linux_relese\033[0m failed! \n" && exit 1
   fi
   if [[ "$ddMode" == '1' ]]; then

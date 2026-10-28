@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
-set -e
+set -eo pipefail
 
 echo "==> 开始安装 zsh 自动补全环境"
 
-GH_PROXY="https://gh-proxy.org/"
-GH_TEST_URL="https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh"
+GH_PROXY="${GH_PROXY_URL:-https://gh-proxy.com/}"
+GH_PROXY="${GH_PROXY%/}/"
 
 USE_GH_PROXY=0
 
@@ -61,99 +61,97 @@ install_dependencies() {
   fi
 }
 
-# 下载测速，成功返回耗时，失败返回空
-test_download_time() {
-  local url="$1"
-  local result
-  local http_code
-  local time_total
-
-  result="$(curl -L -sS -o /dev/null \
-    --connect-timeout 5 \
-    --max-time 20 \
-    -w "%{http_code} %{time_total}" \
-    "$url" 2>/dev/null)" || return 0
-
-  http_code="${result%% *}"
-  time_total="${result##* }"
-
-  if [ "$http_code" = "200" ]; then
-    echo "$time_total"
-  fi
+# 各脚本保持可独立下载；此小段有意不依赖仓库中的公共文件。
+region_get() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 3 --max-time 6 "$1"
+    else
+        wget -qO- --timeout=3 --tries=1 "$1"
+    fi
 }
 
-# 自动判断是否使用 gh-proxy
+detect_region() {
+    case "${INSTALL_REGION:-auto}" in
+        cn|global)
+            echo "==> 手动指定网络区域：$INSTALL_REGION" >&2
+            return
+            ;;
+        auto) ;;
+        *)
+            echo "错误：INSTALL_REGION 只支持 auto、cn、global。" >&2
+            return 1
+            ;;
+    esac
+
+    local country
+    country="$(region_get https://ipapi.co/country/ 2>/dev/null | tr -d '\r\n')" || country=""
+    if ! [[ "$country" =~ ^[A-Z]{2}$ ]]; then
+        country="$(region_get https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^loc=//p' | tr -d '\r\n')" || country=""
+    fi
+    if [ "$country" = CN ]; then
+        INSTALL_REGION=cn
+        echo "==> 出口 IP 地区：CN，优先使用国内加速。" >&2
+    else
+        INSTALL_REGION=global
+        if [[ "$country" =~ ^[A-Z]{2}$ ]]; then
+            echo "==> 出口 IP 地区：$country，优先直连。" >&2
+        else
+            echo "警告：无法识别出口 IP 地区，使用直连；国内机器可设置 INSTALL_REGION=cn。" >&2
+        fi
+    fi
+}
+
+# 强制线路优先于 IP 判断；自动模式只决定优先顺序，不做额外测速。
 detect_github_proxy() {
-  echo "==> 测试 GitHub 直连和 gh-proxy.org 速度"
-
-  # 支持环境变量强制指定
-  # FORCE_GH_PROXY=1 ./install-zsh.sh 强制使用代理
-  # FORCE_GH_PROXY=0 ./install-zsh.sh 强制不用代理
-  if [ "${FORCE_GH_PROXY:-}" = "1" ]; then
-    USE_GH_PROXY=1
-    echo "==> 已通过 FORCE_GH_PROXY=1 强制启用 gh-proxy.org"
-    return
+  case "${FORCE_GH_PROXY:-}" in
+    1) USE_GH_PROXY=1 ;;
+    0) USE_GH_PROXY=0 ;;
+    "")
+      detect_region
+      if [ "$INSTALL_REGION" = cn ]; then USE_GH_PROXY=1; else USE_GH_PROXY=0; fi
+      ;;
+    *) echo "错误：FORCE_GH_PROXY 只支持 0 或 1。" >&2; return 1 ;;
+  esac
+  if [[ "$GH_PROXY" != https://* || "$GH_PROXY" =~ [[:space:]] ]]; then
+    echo "错误：GH_PROXY_URL 必须是无空白字符的 HTTPS URL 前缀。" >&2
+    return 1
   fi
-
-  if [ "${FORCE_GH_PROXY:-}" = "0" ]; then
-    USE_GH_PROXY=0
-    echo "==> 已通过 FORCE_GH_PROXY=0 强制使用 GitHub 直连"
-    return
-  fi
-
-  DIRECT_TIME="$(test_download_time "$GH_TEST_URL")"
-  PROXY_TIME="$(test_download_time "${GH_PROXY}${GH_TEST_URL}")"
-
-  echo "==> GitHub 直连耗时: ${DIRECT_TIME:-失败} 秒"
-  echo "==> gh-proxy 耗时: ${PROXY_TIME:-失败} 秒"
-
-  if [ -z "$DIRECT_TIME" ] && [ -z "$PROXY_TIME" ]; then
-    echo "错误：GitHub 直连和 gh-proxy.org 都不可用"
-    exit 1
-  fi
-
-  if [ -z "$DIRECT_TIME" ]; then
-    USE_GH_PROXY=1
-    echo "==> GitHub 直连失败，使用 gh-proxy.org"
-    return
-  fi
-
-  if [ -z "$PROXY_TIME" ]; then
-    USE_GH_PROXY=0
-    echo "==> gh-proxy.org 失败，使用 GitHub 直连"
-    return
-  fi
-
-  if awk "BEGIN {exit !($PROXY_TIME < $DIRECT_TIME)}"; then
-    USE_GH_PROXY=1
-    echo "==> gh-proxy.org 更快，使用代理"
+  if [ "$USE_GH_PROXY" = 1 ]; then
+    echo "==> GitHub 优先使用第三方代理：$GH_PROXY"
   else
-    USE_GH_PROXY=0
-    echo "==> GitHub 直连更快，使用直连"
+    echo "==> GitHub 优先直连"
   fi
-}
-
-# 根据检测结果处理 GitHub URL
-github_url() {
-  local url="$1"
-
-  if [ "${USE_GH_PROXY:-0}" = "1" ]; then
-    echo "${GH_PROXY}${url}"
-  else
-    echo "$url"
-  fi
-}
-
-curl_github() {
-  local url="$1"
-  curl -fsSL "$(github_url "$url")"
 }
 
 git_clone_github() {
-  local repo_url="$1"
-  local target_dir="$2"
-
-  git clone --depth=1 "$(github_url "$repo_url")" "$target_dir"
+  local repo_url="$1" target_dir="$2" url staging
+  local -a urls clone_cmd
+  if [ "$USE_GH_PROXY" = 1 ]; then
+    urls=("${GH_PROXY}${repo_url}")
+    if [ -z "${FORCE_GH_PROXY:-}" ]; then urls+=("$repo_url"); fi
+  else
+    urls=("$repo_url")
+    if [ -z "${FORCE_GH_PROXY:-}" ]; then urls+=("${GH_PROXY}${repo_url}"); fi
+  fi
+  mkdir -p "$(dirname "$target_dir")" || return 1
+  for url in "${urls[@]}"; do
+    staging="$(mktemp -d "${target_dir}.clone.XXXXXX")" || return 1
+    echo "==> 克隆：$url"
+    clone_cmd=(git -c http.lowSpeedLimit=1024 -c http.lowSpeedTime=20 clone --depth=1 "$url" "$staging/repo")
+    if command_exists timeout; then clone_cmd=(timeout 180 "${clone_cmd[@]}"); fi
+    if GIT_TERMINAL_PROMPT=0 "${clone_cmd[@]}"; then
+      if mv "$staging/repo" "$target_dir"; then
+        rmdir "$staging"
+        return 0
+      fi
+      rm -rf "$staging"
+      return 1
+    fi
+    rm -rf "$staging"
+    echo "警告：克隆失败：$url；自动模式将尝试备用线路。" >&2
+  done
+  echo "错误：无法克隆 $repo_url。可设置 GH_PROXY_URL 或检查网络。" >&2
+  return 1
 }
 
 install_oh_my_zsh() {
@@ -161,12 +159,8 @@ install_oh_my_zsh() {
     echo "==> Oh My Zsh 已存在，跳过安装"
   else
     echo "==> 安装 Oh My Zsh"
-
-    RUNZSH=no \
-    CHSH=no \
-    KEEP_ZSHRC=yes \
-    REMOTE="$(github_url https://github.com/ohmyzsh/ohmyzsh.git)" \
-      sh -c "$(curl_github https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)"
+    # 本脚本自行生成 zshrc 和设置 shell，无需再执行上游安装器的嵌套下载。
+    git_clone_github https://github.com/ohmyzsh/ohmyzsh.git "$HOME/.oh-my-zsh"
   fi
 }
 
@@ -303,12 +297,16 @@ change_default_shell() {
   fi
 }
 
+case "${INSTALL_REGION:-auto}" in auto|cn|global) ;; *) echo "错误：INSTALL_REGION 只支持 auto、cn、global。" >&2; exit 1 ;; esac
+case "${FORCE_GH_PROXY:-}" in ""|0|1) ;; *) echo "错误：FORCE_GH_PROXY 只支持 0 或 1。" >&2; exit 1 ;; esac
 setup_sudo
 install_dependencies
 detect_github_proxy
 install_oh_my_zsh
 install_plugins
-install_fzf
+if ! install_fzf; then
+  echo "警告：fzf 安装失败，继续完成 zsh 配置；之后可用系统包管理器补装。" >&2
+fi
 configure_zshrc
 change_default_shell
 
@@ -316,9 +314,9 @@ echo
 echo "======================================"
 echo "安装完成！"
 echo
-echo "GitHub 下载方式："
+echo "GitHub 首选下载方式（实际切换见上方日志）："
 if [ "${USE_GH_PROXY:-0}" = "1" ]; then
-  echo "已启用 gh-proxy.org"
+  echo "代理：$GH_PROXY"
 else
   echo "使用 GitHub 直连"
 fi

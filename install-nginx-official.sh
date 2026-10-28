@@ -12,10 +12,84 @@ set -Eeuo pipefail
 
 NGINX_BRANCH="${1:-stable}"
 
-KEY_URL="https://nginx.org/keys/nginx_signing.key"
+KEY_URL="${NGINX_KEY_URL:-https://nginx.org/keys/nginx_signing.key}"
 KEYRING="/usr/share/keyrings/nginx-archive-keyring.gpg"
 SOURCE_LIST="/etc/apt/sources.list.d/nginx.list"
 PREFERENCES_FILE="/etc/apt/preferences.d/99nginx"
+
+# 各脚本保持可独立下载；此小段有意不依赖仓库中的公共文件。
+region_get() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 3 --max-time 6 "$1"
+    else
+        wget -qO- --timeout=3 --tries=1 "$1"
+    fi
+}
+
+detect_region() {
+    case "${INSTALL_REGION:-auto}" in
+        cn|global)
+            echo "==> 手动指定网络区域：$INSTALL_REGION" >&2
+            return
+            ;;
+        auto) ;;
+        *)
+            echo "错误：INSTALL_REGION 只支持 auto、cn、global。" >&2
+            return 1
+            ;;
+    esac
+
+    local country
+    country="$(region_get https://ipapi.co/country/ 2>/dev/null | tr -d '\r\n')" || country=""
+    if ! [[ "$country" =~ ^[A-Z]{2}$ ]]; then
+        country="$(region_get https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -n 's/^loc=//p' | tr -d '\r\n')" || country=""
+    fi
+    if [ "$country" = CN ]; then
+        INSTALL_REGION=cn
+        echo "==> 出口 IP 地区：CN，优先使用国内加速。" >&2
+    else
+        INSTALL_REGION=global
+        if [[ "$country" =~ ^[A-Z]{2}$ ]]; then
+            echo "==> 出口 IP 地区：$country，优先直连。" >&2
+        else
+            echo "警告：无法识别出口 IP 地区，使用直连；国内机器可设置 INSTALL_REGION=cn。" >&2
+        fi
+    fi
+}
+
+install_nginx_packages() {
+    local i file backup stamp
+    local -a targets=("$KEYRING" "$SOURCE_LIST" "$PREFERENCES_FILE")
+    local -a staged=("$TMP_DIR/nginx.gpg" "$TMP_DIR/nginx.list" "$TMP_DIR/99nginx")
+    local -a backups=()
+    stamp="$(date +%Y%m%d%H%M%S).$$"
+    for i in "${!targets[@]}"; do
+        file="${targets[$i]}"
+        backup=""
+        if [ -f "$file" ]; then
+            backup="$file.bak.$stamp"
+            cp -p "$file" "$backup" || return 1
+        fi
+        backups+=("$backup")
+    done
+    # 命令链中任一步失败，都恢复本次操作前的源配置；不回退已安装的软件包。
+    if install -m 644 "${staged[0]}" "${targets[0]}" &&
+       install -m 644 "${staged[1]}" "${targets[1]}" &&
+       install -m 644 "${staged[2]}" "${targets[2]}" &&
+       apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update &&
+       apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y nginx; then
+        return 0
+    fi
+    echo "错误：软件源更新或安装失败，恢复原有源配置；软件包可能已部分安装，请检查上方 apt 输出。" >&2
+    for i in "${!targets[@]}"; do
+        if [ -n "${backups[$i]}" ]; then
+            cp -p "${backups[$i]}" "${targets[$i]}" || return 1
+        else
+            rm -f "${targets[$i]}" || return 1
+        fi
+    done
+    return 1
+}
 
 echo "==> 检查 root 权限"
 if [ "$(id -u)" -ne 0 ]; then
@@ -39,6 +113,28 @@ case "$NGINX_BRANCH" in
         ;;
 esac
 
+if [ ! -f /etc/os-release ]; then
+    echo "错误：无法识别系统，仅支持 Debian。" >&2
+    exit 1
+fi
+. /etc/os-release
+if [ "$ID" != debian ]; then
+    echo "错误：此脚本仅支持 Debian。" >&2
+    exit 1
+fi
+case "${INSTALL_REGION:-auto}" in auto|cn|global) ;; *) echo "错误：INSTALL_REGION 只支持 auto、cn、global。" >&2; exit 1 ;; esac
+REPO_URL="${NGINX_REPO_URL:-$REPO_URL}"
+for url in "$REPO_URL" "$KEY_URL"; do
+    if [[ "$url" != https://* || "$url" =~ [[:space:]] ]]; then
+        echo "错误：nginx 仓库和密钥地址必须是无空白字符的 HTTPS URL。" >&2
+        exit 1
+    fi
+done
+if [ "$KEY_URL" != https://nginx.org/keys/nginx_signing.key ] && [ -z "${NGINX_EXPECTED_FINGERPRINT:-}" ]; then
+    echo "错误：自定义密钥地址时必须设置 NGINX_EXPECTED_FINGERPRINT。" >&2
+    exit 1
+fi
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -48,12 +144,20 @@ TMP_GNUPGHOME="$TMP_DIR/gnupg"
 install -d -m 700 "$TMP_GNUPGHOME"
 
 echo "==> 安装先决条件"
-apt update
-apt install -y curl gnupg2 ca-certificates lsb-release debian-archive-keyring
+apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 update
+apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 install -y curl gnupg2 ca-certificates lsb-release debian-archive-keyring
+
+detect_region
+if [ "$INSTALL_REGION" = cn ] && [ -z "${NGINX_REPO_URL:-}" ]; then
+    echo "==> 国内出口：尚未配置可信的 nginx 官方包镜像，保留 nginx.org 官方源。"
+    echo "==> 可通过 NGINX_REPO_URL 指定同分支镜像，或使用已有的 curl/apt 网络代理。"
+fi
 
 echo "==> 联网下载 nginx 官方签名密钥"
 curl -fsSL \
-    --proto '=https' \
+    --connect-timeout 8 --max-time 30 --retry 2 --retry-max-time 90 \
+    --speed-limit 1024 --speed-time 15 \
+    --proto '=https' --proto-redir '=https' \
     --tlsv1.2 \
     "$KEY_URL" \
     -o "$TMP_KEY"
@@ -119,42 +223,29 @@ else
 fi
 
 echo "==> 生成 apt 使用的 keyring 文件"
-rm -f "$KEYRING"
-
-GNUPGHOME="$TMP_GNUPGHOME" \
-gpg --batch --yes --dearmor \
-    -o "$KEYRING" \
-    "$TMP_KEY"
-
-chmod 644 "$KEYRING"
+if [ -n "${NGINX_EXPECTED_FINGERPRINT:-}" ]; then
+    # 只信任已校验的 key，不把下载文件里夹带的其他主密钥一并交给 apt。
+    GNUPGHOME="$TMP_GNUPGHOME" gpg --batch --import "$TMP_KEY"
+    GNUPGHOME="$TMP_GNUPGHOME" gpg --batch --export "$EXPECTED_NORMALIZED" > "$TMP_DIR/nginx.gpg"
+    test -s "$TMP_DIR/nginx.gpg"
+else
+    GNUPGHOME="$TMP_GNUPGHOME" gpg --batch --yes --dearmor -o "$TMP_DIR/nginx.gpg" "$TMP_KEY"
+fi
 
 echo "==> 获取 Debian 发行版代号"
 CODENAME="$(lsb_release -cs)"
 echo "当前系统代号：$CODENAME"
-
-echo "==> 写入 nginx 官方 apt 仓库"
-cat > "$SOURCE_LIST" <<EOF
+cat > "$TMP_DIR/nginx.list" <<EOF
 deb [signed-by=$KEYRING] $REPO_URL $CODENAME nginx
 EOF
-
-echo "已写入：$SOURCE_LIST"
-cat "$SOURCE_LIST"
-
-echo "==> 设置 apt pin，优先使用 nginx.org 官方包"
-cat > "$PREFERENCES_FILE" <<EOF
+cat > "$TMP_DIR/99nginx" <<EOF
 Package: *
-Pin: origin nginx.org
 Pin: release o=nginx
 Pin-Priority: 900
 EOF
-
-echo "已写入：$PREFERENCES_FILE"
-
-echo "==> 更新 apt 缓存"
-apt update
-
-echo "==> 安装 nginx"
-apt install -y nginx
+install -d -m 755 /usr/share/keyrings
+echo "==> 安装 nginx，仓库：$REPO_URL"
+install_nginx_packages
 
 echo "==> 启动并设置 nginx 开机自启"
 systemctl enable nginx
